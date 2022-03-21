@@ -1,4 +1,4 @@
 # iNatTree
 
 ### Purpose ###
-This repo contains a script to use iNaturalist data to generate a phylogenetic tree with images from their own observations.  
+This repo contains a markdown file that uses iNaturalist data to generate a phylogenetic tree with images from users' observations.  
