@@ -1,0 +1,306 @@
+---
+title: "Quantitative Evolutionary Biology: iNaturalist"
+output: html_notebook
+---
+# Installing packages
+
+```{r}
+library(devtools)
+install_github("https://github.com/ropensci/rinat")
+install_github("https://github.com/phylotastic/datelife")
+install.packages("rotl")
+install.packages("jpeg")
+install.packages("plotly")
+install.packages("phytools")
+install.packages("treeplyr")
+```
+# Loading packages
+
+```{r}
+library(rinat)
+library(datelife)
+library(dplyr)
+library(jpeg)
+library(treeplyr)
+library(ape)
+library(httr)
+library(curl)
+library(jsonlite)
+library(rotl)
+library(phytools)
+```
+# Loading functions 
+
+```{r}
+
+getTaxonomyTable <- function(taxalist, rank=r){
+  simpleCap <- function(x) {
+    s <- strsplit(x, "_")[[1]]
+    paste(toupper(substring(s, 1,1)), substring(s, 2),
+          sep="", collapse=" ")
+  }
+  getOttIds <- function(taxalist, ncores=1, context=NULL){
+    scipen <- options()$scipen
+    digits <- options()$digits
+    options("scipen"=100, "digits"=4)
+    .taxalist <- gsub("_", " ", taxalist)
+    .taxalist <- gsub(" sp$", "", .taxalist)
+    tax <- parallel::mclapply(1:length(taxalist),  function(i) try(rotl::tnrs_match_names(.taxalist[i], do_approximate_matching =FALSE, context_name = context)), mc.cores=ncores)
+    failed <- which(sapply(tax,function(x) class(x)[1]=="try-error"))
+    if(length(failed)>0){
+      tax[failed] <- parallel::mclapply(failed,  function(i) try(rotl::tnrs_match_names(.taxalist[i], do_approximate_matching =TRUE, context_name = context)), mc.cores=ncores)
+    }
+    stillfailed <- which(sapply(tax,function(x) if(class(x)[1]=="try-error"){TRUE} else {is.na(x$ott_id)} ))
+    if(length(stillfailed>0)){
+      tax[stillfailed] <- lapply(stillfailed, function(x) data.frame(search_string=.taxalist[x], unique_name=.taxalist[x], approximate_match=NA, ott_id=NA, is_synonym=NA, flags=NA, number_matches=0))
+    }
+    tax <- do.call(rbind, tax)
+    genspec <- unname(sapply(tax[,2], function(x) paste(strsplit(x, split=" ")[[1]][1:2],collapse=" ")))
+    genspec <- gsub(" (genus", " sp.", genspec, fixed=TRUE)
+    genspec <- gsub(" NA", " sp.", genspec, fixed=TRUE)
+    if(sum(duplicated(genspec))>0){
+      cat("Dropping duplicated taxa: ", paste(taxalist[duplicated(genspec)], collapse=", "), "\n")
+    }
+    if(sum(is.na(tax$ott_id))>0){
+      cat("No ott ids found for taxa: ", paste(taxalist[is.na(tax$ott_id)], collapse=", "), "\n")
+    }
+    tax_unique <- tax[!(duplicated(genspec) | is.na(tax$ott_id)),]
+    tax_unique$ottids <- as.character(tax_unique$ott_id)
+    options("scipen"=scipen, "digits"=digits)
+    tax_unique[,1] <- gsub(" ", "_", tax_unique[,1])
+    tax_unique[,1] <- sapply(tax_unique[,1], function(x) simpleCap(x))
+    return(tax_unique)
+  }
+  
+  otts <- getOttIds(taxalist)
+  taxonomies <- lapply(otts$ott_id, function(x) rotl::taxonomy_taxon_info(x, include_lineage = TRUE))
+  taxonomies <- lapply(taxonomies, function(x) do.call(rbind, x[[1]]$lineage))
+  taxonomies <- lapply(taxonomies, function(x) x[x[,"rank"]==rank,])
+  taxtable <- do.call(rbind, taxonomies)
+  return(taxtable)
+}
+sameNames <- function (x) {
+  s <-tolower(x)
+  gsub(" ", "_", s)
+}
+numericNodes<-function(phy) {
+  n<-length(phy$tip.label)
+  m<-phy$Nnode
+  phy$node.label<-(n+1):(n+m)
+  phy
+}
+```
+# Setting your username from iNaturalist and your working directory
+Replace the question marks in this code chunk with your username from iNat
+
+```{r}
+## Replace the question marks below with the directory for where you downloaded the files, your username, and the date you made your observations
+setwd("?")
+username <- c("nicbone", "bkhowell", "jeremy829", "llaurenmorris", "alecfederice", "theazm", "msarah99", "brayD9701")
+```
+# Getting your observations
+We are only taking your observations that are plant or fungi and only observations made in Virginia. We are also determining if the species are native in Virginia.
+
+```{r}
+obs_list <- list()
+
+for(i in 1:length(username)) {
+  temp_obs <- rinat::get_inat_obs_user(username[[i]])
+  temp_obs <- filter(temp_obs, grepl("VA", temp_obs$place_guess))
+  temp_obs <- filter(temp_obs, iconic_taxon_name == "Plantae")
+  obs_list[[i]] <- temp_obs
+}
+
+obs <- bind_rows(obs_list, .id = "user")
+obs$genspec <- gsub(" ", "_", as.character(obs$scientific_name))
+obs <- as.data.frame(obs)
+obs <- filter(obs, grepl("_", obs$genspec))
+
+ottTable <- tnrs_match_names(obs$genspec)
+length(ottTable$unique_name)
+ottTable<- rename(ottTable, scientific_name = search_string)
+ottids <-ottTable[ottTable$flags == "", ]
+ottids <- na.omit(ottids)
+head(ottids)
+obs$scientific_name<-sameNames(obs$scientific_name)
+native_status<-matrix(data=NA, nrow = length(ottids$ott_id), ncol = 2)
+colnames(native_status)<-c("ott_id", "native")
+
+
+for (t in 1:length(ottids$ott_id)) {
+  
+  native_status[t,1]<-ottids$ott_id[t]
+  url <- "https://inaturalist.org"
+  places <- "/places.json?"
+  taxon <- gsub(" ", "", paste("taxon=",gsub(" ", "+", ottids$unique_name[t])))
+  place_type <- "place_type=state"
+  state <- "q=Virginia"
+  em <- "establishment_means=native"
+  stat<-httr::GET(url, path=paste(places, paste(taxon, place_type, state, em, sep = "&"), sep = ""))
+  stat<-httr::content(stat)
+  
+  if (length(stat)==0) {
+    
+    native_status[t,2]<-0
+    
+  } else {
+    
+    native_status[t,2]<-1
+  }
+}
+native_status<-as.data.frame(native_status)
+ottids<-merge(ottids, native_status, by = "ott_id")
+# making one big object with both obs and ottids
+o <- merge(obs, ottids, by = "scientific_name")
+o <- o[!o$image_url == "", ]
+```
+# Getting node ages from open tree of life
+First, we get estimates of all node ages for a given node in our tree.Then we can take the minimum and maximum age estimates to use later on. 
+
+```{r}
+synth_tree <- rotl::tol_induced_subtree(ott_ids=ottids$ott_id, label_format = "id")
+nodes <- synth_tree$node.label
+
+res <- list()
+for(i in 1:length(nodes)){
+  
+  body <- list(node=nodes[i])
+  path <- "dates/synth_node_age"
+  url <- "https://dates.opentreeoflife.org"
+  node_id <- gsub(" ", "_", nodes[i])
+  otl_v <- "v4"
+  body_json <- ifelse(length(body), jsonlite::toJSON(body), "")
+  httr::set_config(httr::config(ssl_verifypeer = 0L))
+  
+  req <- httr::GET(url, path = paste(otl_v, path, node_id, sep = "/"))
+  
+  res[[i]] <- httr::content(req)
+}
+synth_tree<-numericNodes(synth_tree)
+ages <- list()
+for(i in 1:length(res)) {
+  t <- unlist(res[[i]]$`ot:source_node_ages`)
+  if(is.null(t)) {
+    ages[[i]]<-NA
+  } else{
+    a <- as.numeric(t[names(t) == "age"])
+    ages[[i]] <- sort(a)
+  }
+}
+# taking the minimum and maximum node ages per node
+mins<-sapply(ages, FUN=min)
+maxs<-sapply(ages, FUN=max)
+
+# naming the mins and maxs by what node they are for to keep track when dropping NAs 
+names(mins)<-synth_tree$node.label
+names(maxs)<-synth_tree$node.label
+
+mins<-na.omit(mins)
+maxs<-na.omit(maxs)
+```
+# Making dated tree from node ages 
+We will use the node ages we collected in the previous chunk to date the rest of our tree. We will have to test a few different models of evolution for the substitution rate among the branches in our tree and compare them.
+
+```{r}
+# making up branch lengths so we can run chronos
+synth_tree$edge.length <- rep(1, length(synth_tree$edge)/2)
+
+
+# making dated tree, what model should we assume? 
+ChronosCalib<-makeChronosCalib(synth_tree, age.min = mins, age.max = maxs, node = 
+                                      as.numeric(names(mins)))
+
+# let's test some of the options (either discrete, correlated, or relaxed)
+chronogramD <- chronos(synth_tree, model="discrete", calibration=ChronosCalib)
+chronogramC <- chronos(synth_tree, model="correlated", calibration=ChronosCalib)
+chronogramR <- chronos(synth_tree, model = "relaxed", calibration=ChronosCalib)
+
+# look at the log-likelihood and PHIIC, these can help us determine which model performs the best
+# Higher log-likelihood and lower PHICC == a better model fit
+
+# plot your trees, do they look similar?
+par(mfrow = c(1,3))
+plot(chronogramD, main = "discrete")
+plot(chronogramC, main = "correlated")
+plot(chronogramR, main = "relaxed")
+```
+# Let's replace the question marks to use dated tree that had the best model fit and plot that tree
+Which model performed the best for your observations (look at log-likelihood and PHIIC)? This may be different than the best supported model of your classmates. Replace the question marks below with the letter that corresponds to your best chronogram (i.e. dated tree).
+
+```{r}
+## Replace the question marks below with the chronogram for the model that fit your data best (there's 4 of them)
+class(chronogramC)<-"phylo"
+
+# getting the tips of the tree to match the data we have
+chronogramC$tip.label<-gsub("ott", "", chronogramC$tip.label)
+td <- make.treedata(chronogramC, o)
+# using species names as tip labels instead of ott numbers
+td$phy$tip.label<-as.character(td$dat$unique_name)
+plot(td$phy)
+```
+# Let's figure out how many million years of evolution you saw
+Each node in the tree is given an "age" (or height above the root) which we can look at using the function nodeHeights. The age of each node given in millions of years.
+
+```{r}
+# Finish the code below to see the node ages in your tree, what input does this function take?
+nodeHeights(?)
+
+# We have the ages of each node now, but we just want to know the total age of the tree... How can we get this from our list of all known node ages? Hint: the function help page might be useful...
+
+## Add in code to find the age of your tree
+```
+# Let's see if there is phylogenetic signal in species that are native vs invasive
+We will use the D statistic to calculate phylogenetic signal since it can be used with discrete traits
+
+```{r}
+## testing for phylogenetic signal in native status 
+data<-as.data.frame(td$dat)
+caper::phylo.d(data[,c("unique_name","native")], td$phy, names.col = unique_name, binvar = native)
+```
+# Plotting your best tree with your images from iNaturalist
+Don't worry too much about the code here, we just want you to be able to see your observations directly on the phylogeny!
+
+```{r}
+library(httr)
+library(ggimage)
+library(ggtree)
+
+subDir<-"imgs"
+if (file.exists(paste("./",subDir, sep = ""))){
+    setwd(paste("./",subDir, sep = ""))
+} else {
+    dir.create(paste("./",subDir, sep = ""))
+    setwd(paste("./",subDir, sep = ""))
+
+}
+tiplabels <- as.character(td$phy$tip.label)
+
+for(i in 1:length(td$dat$image_url))
+GET(as.character(td$dat$image_url[[i]]), 
+    write_disk(paste0(tiplabels[[i]], ".png", sep=""), overwrite=TRUE))
+tree <- td$phy
+dat <- td$dat
+id <- tree$tip.label
+img_url <- td$dat$image_url
+dat <- tibble::tibble(id = id, img = img_url)
+t1 <- ggtree(tree)
+meta <- t1$data %>% 
+  dplyr::inner_join(dat, c('label' = 'id'))
+
+
+
+tips <- as.character(seq(td$phy$tip.label))
+
+img_list <- list.files(path = "./", all.files = FALSE)
+img_info <- data.frame(tiplabels, img_list)
+
+size<-0.5/length(td$phy$tip.label)
+
+p <- ggtree(tree) + xlim(0,max(nodeHeights(td$phy))+250) + 
+  geom_tiplab(aes(subset = isTip), image=paste0('./', '/', 
+  tiplabels,'.png'), geom="image", offset =  2, align = 1, size = size) +
+  geom_tiplab(aes(subset = isTip), offset = size*1000)
+
+p
+```
+
