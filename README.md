@@ -3,4 +3,3 @@
 ### Purpose ###
 This repo contains a markdown file that uses iNaturalist data to generate a phylogenetic tree with images from users' observations.  
 
-![Alt text](IGCposter_corrected.svg)
